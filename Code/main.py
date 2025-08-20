@@ -1,183 +1,244 @@
-import json
 import os
-import queue
 import sys
+import json
+import random
+import queue
+import re
+import subprocess
+import requests
 from datetime import datetime
-
+from bs4 import BeautifulSoup
 import sounddevice as sd
 import torch
-import pyttsx3
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import soundfile as sf
 from vosk import Model, KaldiRecognizer
-import subprocess  # для запуска браузера
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from difflib import get_close_matches
+import time
 
-# ===== КОНФИГУРАЦИЯ =====
-MODEL_PATH = r"C:\Voice Helper\model"
-RUGPT_MODEL = r"C:\Voice Helper\rugpt3medium"  # Изменено на ruGPT3medium
+# === Настройки ===
+MODEL_PATH = r"C:\\VoiceHelper\\model"
+RUGPT_PATH = r"C:\\VoiceHelper\\rugpt3medium"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 SAMPLE_RATE = 16000
+API_KEY = "113c5dcb2f6164b9797c19b806fbc21b"
+CITY = "Владивосток"
 
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
-def speak(engine, text):
-    """Произнесение текста"""
-    print(f"Ответ: {text}")
-    engine.say(text)
-    engine.runAndWait()
+# === Проверка PyTorch ===
+if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 6):
+    print("Пожалуйста, обновите PyTorch до версии 2.6.0 или выше")
+    sys.exit(1)
+
+# === Фразы ===
+JOKES = [
+    "Ты знаешь, программисты — это особый вид людей...",
+    "Удалил system32, и всё стало летать! Правда в BIOS...",
+    "Почему компьютер не купается? Потому что у него Windows!",
+    "Сказали выбрать: жена или компьютер... Запускаюсь...",
+    "Ошибка 404: анекдот не найден. Но я старалась!"
+]
+
+CALL_REPLIES = ["А?", "Я здесь!", "Да?"]
+NAME_REPLIES = [
+    "Я Лира, голосовой помощник. Приятно познакомиться!",
+    "Меня зовут Лира. Я умею отвечать и слушать.",
+    "Я Лира. Работаю даже без интернета!"
+]
+ABOUT_REPLIES = [
+    "Я Лира. Мои создатели — Мельников Юрий и Пинчук Максим.",
+    "Работаю офлайн, использую Python и Vosk.",
+    "Голосовой ассистент Лира. Без интернета, но с душой."
+]
+IDLE_REPLIES = [
+    "Я тут. Просто скажи, что нужно.",
+    "Могу рассказать анекдот или включить таймер.",
+    "Спроси что-нибудь!"
+]
+
+YES_WORDS = ["да", "ага", "точно", "конечно", "естественно"]
+NO_WORDS = ["нет", "неа", "ни в коем случае"]
+
+chat_history = []
+commands = {}
+
+# === Логика команд через декоратор ===
+def command(trigger):
+    def wrapper(func):
+        commands[trigger] = func
+        return func
+    return wrapper
+
+# === Помощники ===
+def clean(text):
+    return re.sub(r'[.,!?…]+$', '', text.strip())
+
+def log_interaction(text):
+    with open("log.txt", "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now()}: {text}\n")
+
+def is_similar(phrase, examples):
+    return get_close_matches(phrase, examples, n=1, cutoff=0.6)
 
 def listen(recognizer):
-    """Запись и распознавание речи"""
     q = queue.Queue()
-
     def callback(indata, frames, time, status):
-        if status:
-            print(status, file=sys.stderr)
         q.put(bytes(indata))
-
-    print("\nСлушаю...")
-    with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=8000, dtype='int16',
-                           channels=1, callback=callback):
+    with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=8000, dtype='int16', channels=1, callback=callback):
         while True:
             data = q.get()
             if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
-                return result.get("text", "").lower()  # Приводим к нижнему регистру
+                res = json.loads(recognizer.Result())
+                return res.get("text", "").lower()
 
-def generate_response(pipe, prompt):
-    """Генерация ответа с помощью RuGPT"""
+def speak(text):
+    if not text.strip():
+        text = random.choice(IDLE_REPLIES)
+    print("Лира:", text)
+    tts.tts_to_file(text=text, file_path="output.wav")
+    data, samplerate = sf.read("output.wav")
+    sd.play(data, samplerate)
+    sd.wait()
+
+def search_brief(query):
     try:
-        response = pipe(
-            prompt,
-            max_new_tokens=50,  # сокращаем длину генерации
-            num_return_sequences=1,
-            pad_token_id=pipe.tokenizer.eos_token_id,
-            do_sample=True,
-            temperature=0.7,
-            top_k=50,
-            top_p=0.85,
-            repetition_penalty=1.2  # штраф за повторение
-        )
-        text = response[0]['generated_text']
-        # Обрезаем исходный prompt из текста ответа (если есть)
-        if text.startswith(prompt):
-            text = text[len(prompt):].strip()
-        # На случай очень длинного ответа — ограничиваем длину вручную
-        return text.split('\n')[0].strip()
-    except Exception as e:
-        print(f"Ошибка генерации ответа: {e}")
-        return "Извините, не удалось сгенерировать ответ."
+        html = requests.get(f"https://duckduckgo.com/html/?q={query}", headers={"User-Agent": "Mozilla/5.0"}).text
+        soup = BeautifulSoup(html, "html.parser")
+        result = soup.find("a", class_="result__snippet")
+        return result.text.strip() if result else "Не знаю ответа."
+    except:
+        return "Ошибка при поиске."
 
-def check_system():
-    """Проверка доступности ресурсов"""
-    print("\n=== СИСТЕМНАЯ ИНФОРМАЦИЯ ===")
-    print(f"PyTorch версия: {torch.__version__}")
-    print(f"Устройство: {DEVICE.upper()}")
-    if DEVICE == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    print("==========================\n")
+def generate_reply(prompt):
+    context = "\n".join(chat_history[-3:] + [prompt])
+    result = rugpt(context, max_new_tokens=50, do_sample=True)[0]['generated_text']
+    response = clean(result.replace(prompt, "")).strip()
+    endings = [" А ты что скажешь?", " Надеюсь, помогла.", " Если что, я рядом."]
+    return response + random.choice(endings)
 
-def init_models():
-    """Инициализация всех моделей"""
+# === Команды ===
+
+@command("как тебя зовут")
+@command("твое имя")
+@command("кто ты")
+def cmd_name(cmd):
+    speak(random.choice(NAME_REPLIES))
+
+@command("кто тебя создал")
+@command("о себе")
+@command("как ты работаешь")
+def cmd_about(cmd):
+    speak(random.choice(ABOUT_REPLIES))
+
+@command("анекдот")
+def cmd_joke(cmd):
+    speak(random.choice(JOKES))
+
+@command("монетк")
+@command("подбрось")
+def cmd_coin(cmd):
+    speak(random.choice(["Орёл", "Решка"]))
+
+@command("как дела")
+def cmd_mood(cmd):
+    speak("Всё хорошо, спасибо!")
+
+@command("день недели")
+def cmd_day(cmd):
+    days = {
+        "Monday": "понедельник", "Tuesday": "вторник", "Wednesday": "среда",
+        "Thursday": "четверг", "Friday": "пятница", "Saturday": "суббота", "Sunday": "воскресенье",
+    }
+    day = datetime.now().strftime("%A")
+    speak(f"Сегодня {days.get(day, day)}")
+
+@command("время")
+@command("на часах")
+@command("который час")
+def cmd_time(cmd):
+    now = datetime.now().strftime('%H:%M')
+    speak(f"Сейчас {now}")
+
+@command("погода")
+def cmd_weather(cmd):
     try:
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(
-                f"Модель Vosk не найдена по пути: {MODEL_PATH}. "
-                f"Скачайте с https://alphacephei.com/vosk/models и распакуйте в указанную папку."
-            )
-        print("Инициализация Vosk...")
-        vosk_model = Model(MODEL_PATH)
-        recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+        data = requests.get(f"http://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={API_KEY}&units=metric&lang=ru").json()
+        temp = data['main']['temp']
+        desc = data['weather'][0]['description']
+        speak(f"Во {CITY} сейчас {temp} градусов, {desc}.")
+    except:
+        speak("Не удалось получить погоду.")
 
-        print("Инициализация TTS...")
-        engine = pyttsx3.init()
-        voices = engine.getProperty('voices')
-        if voices:
-            engine.setProperty('voice', voices[0].id)
+@command("открой браузер")
+def cmd_browser(cmd):
+    speak("Открываю браузер.")
+    subprocess.Popen(["start", "http://www.google.com"], shell=True)
 
-        print("\nЗагрузка RuGPT-3 Medium...")  # Изменено на RuGPT-3 Medium
-        tokenizer = AutoTokenizer.from_pretrained(RUGPT_MODEL)
-        model = AutoModelForCausalLM.from_pretrained(
-            RUGPT_MODEL,
-            torch_dtype=TORCH_DTYPE
-        ).to(DEVICE)
+@command("пока")
+@command("выход")
+@command("стоп")
+def cmd_exit(cmd):
+    speak("Пока!")
+    sys.exit(0)
 
-        rugpt_pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            device=0 if DEVICE == "cuda" else -1
-        )
-
-        print("Все модели успешно загружены!")
-        return recognizer, engine, rugpt_pipe
-
-    except Exception as e:
-        raise RuntimeError(f"Ошибка инициализации моделей: {str(e)}")
-
-def handle_command(command, engine):
-    """
-    Обработка базовых команд программно.
-    Возвращает True, если команда распознана и выполнена,
-    False — если команда неизвестна.
-    """
-    if any(x in command for x in ["стоп", "выход", "пока", "закройся", "закрыться"]):
-        speak(engine, "До свидания! Завершаю работу.")
-        sys.exit(0)
-    elif "время" in command:
-        now = datetime.now().strftime('%H:%M')
-        speak(engine, f"Сейчас {now}")
+# === Обработка команд ===
+def handle_cmd(cmd):
+    for trigger, func in commands.items():
+        if trigger in cmd:
+            func(cmd)
+            return True
+    if any(q in cmd for q in ["что такое", "кто такой", "что значит"]):
+        q = re.sub(r"(что такое|кто такой|что значит)", "", cmd).strip()
+        res = search_brief(q)
+        speak(f"{q.capitalize()} — это {clean(res)}")
         return True
-    elif "открой браузер" in command or "запусти браузер" in command:
-        speak(engine, "Открываю браузер.")
-        # Пример для Windows - запускаем стандартный браузер по умолчанию
-        try:
-            if sys.platform.startswith('win'):
-                os.startfile("http://www.google.com")
-            elif sys.platform.startswith('darwin'):
-                subprocess.Popen(['open', 'http://www.google.com'])
-            else:  # linux и др.
-                subprocess.Popen(['xdg-open', 'http://www.google.com'])
-        except Exception as e:
-            speak(engine, "Не удалось открыть браузер.")
-            print(f"Ошибка открытия браузера: {e}")
-        return True
-    # Можно добавить другие команды здесь
     return False
 
+# === Главная функция ===
 def main():
-    check_system()
+    print("Загрузка...")
+    print("Устройство:", DEVICE)
 
-    try:
-        recognizer, engine, rugpt_pipe = init_models()
-        speak(engine, "Голосовой помощник запущен и готов к работе.")
+    vosk_model = Model(MODEL_PATH)
+    recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
 
-        while True:
-            try:
-                command = listen(recognizer)
-                if not command:
-                    continue
+    global rugpt, tts
+    tokenizer = AutoTokenizer.from_pretrained(RUGPT_PATH)
+    model = AutoModelForCausalLM.from_pretrained(RUGPT_PATH, torch_dtype=TORCH_DTYPE).to(DEVICE)
+    rugpt = pipeline("text-generation", model=model, tokenizer=tokenizer, device=0 if DEVICE == "cuda" else -1)
 
-                print(f"\nРаспознано: {command}")
+    from TTS.api import TTS
+    tts = TTS(model_name="tts_models/ru/v3_1_ru", progress_bar=False, gpu=torch.cuda.is_available())
 
-                # Обработка базовых команд
-                if handle_command(command, engine):
-                    continue
+    speak("Привет! Я Лира. Чем могу помочь?")
 
-                # Если команда не распознана, генерируем ответ
-                answer = generate_response(rugpt_pipe, command)
-                speak(engine, answer)
+    while True:
+        try:
+            cmd = listen(recognizer)
+            print("Вы сказали:", cmd)
+            log_interaction(f"Ты: {cmd}")
 
-            except KeyboardInterrupt:
-                speak(engine, "Принудительное завершение.")
-                break
-            except Exception as e:
-                print(f"Ошибка в основном цикле: {e}")
-                speak(engine, "Произошла ошибка, повторите команду.")
+            if "лира" in cmd:
+                cmd = cmd.replace("лира", "").strip()
 
-    except Exception as e:
-        print(f"\nКРИТИЧЕСКАЯ ОШИБКА: {e}")
-        sys.exit(1)
+            if handle_cmd(cmd):
+                continue
+
+            if not cmd or len(cmd.split()) < 2:
+                continue
+
+            reply = generate_reply(cmd)
+            chat_history.append(f"Ты: {cmd}")
+            chat_history.append(f"Лира: {reply}")
+            log_interaction(f"Лира: {reply}")
+            speak(reply)
+
+        except KeyboardInterrupt:
+            speak("Завершаю.")
+            break
+        except Exception as e:
+            print("Ошибка:", e)
+            speak("Произошла ошибка.")
 
 if __name__ == "__main__":
     main()
